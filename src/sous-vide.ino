@@ -1,4 +1,6 @@
 #include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>              // MQTT, Ota
+#include <ESP8266httpUpdate.h>              // Ota
 #include <PubSubClient.h>
 #include <OneWire.h> 
 #include <DallasTemperature.h>
@@ -9,6 +11,22 @@
 #include <math.h>
 #include "secrets.h"
 #include "relay.h"
+
+#define VERSION_STRING "Sonoff sousvide Oded - v1.05"
+
+// -- HTTP ----------------------------------------
+#define USE_WEBSERVER                            // Enable web server and wifi manager (+66k code, +8k mem)
+  #define WEB_PORT             80                // Web server Port for User and Admin mode
+  #define WEB_USERNAME         "admin"           // Web server Admin mode user name
+  #define USE_EMULATION                          // Enable Belkin WeMo and Hue Bridge emulation for Alexa (+16k code, +2k mem)
+
+
+
+// Oded
+#ifdef USE_WEBSERVER
+  #include <ESP8266WebServer.h>             // WifiManager, Webserver
+  #include <DNSServer.h>                    // WifiManager
+#endif  // USE_WEBSERVER
 
 #define RELAY_PIN 12
 #define LED_PIN 13
@@ -34,6 +52,13 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length);
 #define MQTT_TOPIC_AUTOTUNE_KD "sous-vide/autotune_kd"
 #define MQTT_TOPIC_AUTOTUNE_KI "sous-vide/autotune_ki"
 
+#define MQTT_TOPIC_GET_PARAMS "sous-vide/get_params"
+
+#define MQTT_TOPIC_UPDATE "sous-vide/update"
+#define MQTT_TOPIC_UPDATE_FAILED "sous-vide/updateFailed"
+#define MQTT_TOPIC_UPDATE_OK "sous-vide/updateOK"
+
+#define MQTT_TOPIC_VERSION "sous-vide/version"
 #define PID_WINDOW_SIZE 20000
 
 #define ONE_WIRE_BUS_PIN 14
@@ -130,6 +155,35 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length)
     Serial.print("New Ki: ");
     Serial.println(msg);
   }
+  else if (!strcmp(topic, MQTT_TOPIC_UPDATE))
+  {
+    strncpy(msg, (char *)payload, length);
+    msg[length] = 0;
+
+    Serial.print("Updating... (" + String(msg) + ") ");
+    mqtt_client.publish(MQTT_TOPIC_UPDATE_OK, "Updating...");
+    t_httpUpdate_return ret = ESPhttpUpdate.update("do.odedsharon.com", 80, "/sonoff/sousvide.bin");
+
+     switch (ret) {
+      case HTTP_UPDATE_FAILED:
+        Serial.printf("HTTP_UPDATE_FAILD Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+        mqtt_client.publish(MQTT_TOPIC_UPDATE_FAILED, ESPhttpUpdate.getLastErrorString().c_str());
+        break;
+
+      case HTTP_UPDATE_NO_UPDATES:
+        Serial.println("HTTP_UPDATE_NO_UPDATES");
+        mqtt_client.publish(MQTT_TOPIC_UPDATE_FAILED, "HTTP_UPDATE_NO_UPDATES");
+        break;
+
+      case HTTP_UPDATE_OK:
+        Serial.println("HTTP_UPDATE_OK");
+        mqtt_client.publish(MQTT_TOPIC_UPDATE_OK, "Updated!");
+        break;
+    }
+
+    Serial.print("Updated ");
+    Serial.println(msg);
+  }
   else if (!strcmp(topic, MQTT_TOPIC_TUNING))
   {
     if (!strncmp((char*)payload, "ON", 2) || !strncmp((char*)payload, "1", 1))
@@ -159,6 +213,15 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length)
     cooker_pid.SetOutputLimits(0, window_size);
     Serial.print("New window size: ");
     Serial.println(msg);
+  }
+  else if (!strcmp(topic, MQTT_TOPIC_GET_PARAMS))
+  {
+    //strncpy(msg, (char *)payload, length);
+    //msg[length] = 0;
+    PublishParamsToMQTT();
+
+    //  Serial.print("New window size: ");
+    //Serial.println(msg);
   }
 }
 
@@ -254,8 +317,23 @@ void subscribe_mqtt_topics()
   mqtt_client.subscribe(MQTT_TOPIC_KI);
   mqtt_client.subscribe(MQTT_TOPIC_KD);
   mqtt_client.subscribe(MQTT_TOPIC_TUNING);
+  mqtt_client.subscribe(MQTT_TOPIC_UPDATE);
+  mqtt_client.subscribe(MQTT_TOPIC_GET_PARAMS);
+  
+  
 }
 
+
+void PublishParamsToMQTT() 
+{
+  // publish set points
+  mqtt_client.publish(MQTT_TOPIC_VERSION, VERSION_STRING);
+  mqtt_client.publish(MQTT_TOPIC_SETPOINT, float_to_str(pid_setpoint));
+  mqtt_client.publish(MQTT_TOPIC_KP, float_to_str(pid_kp));
+  mqtt_client.publish(MQTT_TOPIC_KI, float_to_str(pid_ki));
+  mqtt_client.publish(MQTT_TOPIC_KD, float_to_str(pid_kd));
+  mqtt_client.publish(MQTT_TOPIC_PROBE_ERROR, "OFF");
+}
 // the setup function runs once when you press reset or power the board
 void setup() 
 {
@@ -278,15 +356,11 @@ void setup()
   cooker_pid.SetMode(AUTOMATIC);
 
   Serial.begin(115200);
+  Serial.println(VERSION_STRING);
   start_wifi();
   connect_all_the_things();
 
-  // publish set points
-  mqtt_client.publish(MQTT_TOPIC_SETPOINT, float_to_str(pid_setpoint));
-  mqtt_client.publish(MQTT_TOPIC_KP, float_to_str(pid_kp));
-  mqtt_client.publish(MQTT_TOPIC_KI, float_to_str(pid_ki));
-  mqtt_client.publish(MQTT_TOPIC_KD, float_to_str(pid_kd));
-  mqtt_client.publish(MQTT_TOPIC_PROBE_ERROR, "OFF");
+  PublishParamsToMQTT();
 
   relay.off();
 
@@ -298,6 +372,11 @@ void setup()
 
 void loop() 
 {
+  
+  // reconnect if the connection to the MQTT broker is lost
+  if (!mqtt_client.loop())
+    connect_all_the_things();
+
   // Don't probe temp too fast or it will return errors  
   if (millis() - last_probed_temp > PROBE_TEMP_INTERVAL)
   {
@@ -374,10 +453,7 @@ void loop()
     }
   }
 
-  // reconnect if the connection to the MQTT broker is lost
-  if (!mqtt_client.loop())
-    connect_all_the_things();
-
+  
   // publish the temp every couple of seconds
   if (millis() - last_temp_sent > MQTT_SENT_TEMP_INTERVAL)
   {
